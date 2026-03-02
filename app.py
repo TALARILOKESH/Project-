@@ -1,4 +1,5 @@
 from flask import Flask, render_template, request
+from ultralytics import YOLO
 import os
 import cv2
 import torch
