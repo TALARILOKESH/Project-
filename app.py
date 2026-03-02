@@ -112,5 +112,3 @@ def index():
                            good_count=good_count,
                            bad_count=bad_count)
 
-if __name__ == "__main__":
-    app.run()
