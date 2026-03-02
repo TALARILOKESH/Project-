@@ -1,108 +1,162 @@
-from flask import Flask, render_template, request
+from flask import Flask, request, render_template_string, send_from_directory
 import os
+import time
 import cv2
 import torch
-import numpy as np
-from torchvision import transforms, models
+from ultralytics import YOLO
+from torchvision import models, transforms
+from PIL import Imaget transforms, models
 from PIL import Image
 from ultralytics import YOLO
 from werkzeug.utils import secure_filename
+# ================= CONFIG =================
+YOLO_MODEL_PATH = "model/best.pt"
+EFF_MODEL_PATH = "model/efficientnet_b0_best.pth"
+
+CLASS_MAP = {0: "BAD", 1: "GOOD"}
+NUM_CLASSES = 2
+CONF_THRESHOLD = 0.75
+
+UPLOAD_DIR = "uploads"
+RESULT_DIR = "results"
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+# =========================================
 
 app = Flask(__name__)
 
-UPLOAD_FOLDER = "static/uploads"
-PROCESSED_FOLDER = "static/processed"
+# -------- Load Models ONCE --------
+print("Loading YOLO model...")
+yolo = YOLO(YOLO_MODEL_PATH)
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+print("Loading EfficientNet model...")
+eff_model = models.efficientnet_b0(weights=None)
+eff_model.classifier[1] = torch.nn.Linear(
+    eff_model.classifier[1].in_features, NUM_CLASSES
+)
+eff_model.load_state_dict(torch.load(EFF_MODEL_PATH, map_location="cpu"))
+eff_model.eval()
 
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["PROCESSED_FOLDER"] = PROCESSED_FOLDER
-
-# -------------------------------
-# 🔥 LOAD YOLOv8 MODEL
-# -------------------------------
-yolo_model = YOLO("model/best.pt")
-
-# -------------------------------
-# 🔥 LOAD EFFICIENTNET MODEL
-# -------------------------------
-classifier = models.efficientnet_b0(pretrained=False)
-classifier.classifier[1] = torch.nn.Linear(classifier.classifier[1].in_features, 2)
-classifier.load_state_dict(torch.load("model/efficientnet_b0_best.pth", map_location="cpu"))
-classifier.eval()
-
+# -------- Preprocessing --------
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
 ])
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    image_path = None
-    processed_path = None
-    good_count = 0
-    bad_count = 0
+# -------- HTML --------
+HTML = """
+<!doctype html>
+<title>Tomato Quality Detection</title>
 
-    if request.method == "POST":
-        file = request.files["image"]
+<h2>🍅 Tomato Quality Detection</h2>
 
-        if file:
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-            file.save(filepath)
+<form method="post" action="/upload" enctype="multipart/form-data">
+  <input type="file" name="image" required>
+  <br><br>
+  <button type="submit">Analyze</button>
+</form>
 
-            image_path = filepath
-            img = cv2.imread(filepath)
+{% if result %}
+<hr>
+<h3>{{ result }}</h3>
+<img src="{{ image_path }}" width="500">
+<br><br>
+<a href="/">Analyze another image</a>
+{% endif %}
+"""
 
-            # 🔥 YOLOv8 Detection
-            results = yolo_model(img)
+# -------- Routes --------
+@app.route("/")
+def home():
+    return render_template_string(HTML)
 
-            for result in results:
-                boxes = result.boxes
+@app.route("/results/<path:filename>")
+def serve_results(filename):
+    return send_from_directory(RESULT_DIR, filename)
 
-                for box in boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+@app.route("/upload", methods=["POST"])
+def upload():
+    if "image" not in request.files:
+        return "<h3>No image selected</h3><a href='/'>Go back</a>"
 
-                    crop = img[y1:y2, x1:x2]
+    file = request.files["image"]
+    if file.filename == "":
+        return "<h3>No image selected</h3><a href='/'>Go back</a>"
 
-                    if crop.size == 0:
-                        continue
+    timestamp = int(time.time() * 1000)
+    img_path = os.path.join(UPLOAD_DIR, f"{timestamp}.jpg")
+    file.save(img_path)
 
-                    crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                    crop_tensor = transform(crop_pil).unsqueeze(0)
+    frame = cv2.imread(img_path)
 
-                    with torch.no_grad():
-                        output = classifier(crop_tensor)
-                        _, pred = torch.max(output, 1)
+    # 🔥 Resize to reduce memory
+    frame = cv2.resize(frame, (640, 640))
 
-                    # Adjust if your labels reversed
-                    if pred.item() == 0:
-                        label = "Good"
-                        color = (0, 255, 0)
-                        good_count += 1
-                    else:
-                        label = "Bad"
-                        color = (0, 0, 255)
-                        bad_count += 1
+    results = yolo.predict(
+        source=frame,
+        imgsz=416,
+        conf=0.4,
+        verbose=False
+    )[0]
 
-                    # Draw bounding box
-                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(img, label, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.8, color, 2)
+    detected = good_count = bad_count = 0
 
-            # Save processed image
-            processed_filename = "processed_" + filename
-            processed_filepath = os.path.join(app.config["PROCESSED_FOLDER"], processed_filename)
-            cv2.imwrite(processed_filepath, img)
+    for box in results.boxes:
+        cls_id = int(box.cls[0])
 
-            processed_path = processed_filepath
+        if yolo.names[cls_id].lower() != "tomato":
+            continue
 
-    return render_template("index.html",
-                           image_path=image_path,
-                           processed_path=processed_path,
-                           good_count=good_count,
-                           bad_count=bad_count)
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
 
-# DO NOT use app.run() for Render
+        pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        tensor = transform(pil_img).unsqueeze(0)
+
+        with torch.no_grad():
+            probs = torch.softmax(eff_model(tensor), dim=1)
+            pred = torch.argmax(probs, dim=1).item()
+            conf = probs[0][pred].item()
+
+        if conf < CONF_THRESHOLD:
+            continue
+
+        quality = CLASS_MAP[pred]
+        color = (0, 255, 0) if quality == "GOOD" else (0, 0, 255)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            frame,
+            f"{quality} {conf:.2f}",
+            (x1, max(y1 - 10, 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2
+        )
+
+        detected += 1
+        if quality == "GOOD":
+            good_count += 1
+        else:
+            bad_count += 1
+
+    if detected == 0:
+        return "<h3>No tomatoes detected ❌</h3><a href='/'>Try again</a>"
+
+    final_img = f"final_{timestamp}.jpg"
+    cv2.imwrite(f"{RESULT_DIR}/{final_img}", frame)
+
+    return render_template_string(
+        HTML,
+        result=f"Detected {detected} | GOOD: {good_count} | BAD: {bad_count}",
+        image_path=f"/results/{final_img}"
+    )
