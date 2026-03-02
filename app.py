@@ -1,11 +1,11 @@
 from flask import Flask, render_template, request
-from ultralytics import YOLO
 import os
 import cv2
 import torch
 import numpy as np
 from torchvision import transforms, models
 from PIL import Image
+from ultralytics import YOLO
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -20,21 +20,16 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["PROCESSED_FOLDER"] = PROCESSED_FOLDER
 
 # -------------------------------
-# 🔥 LOAD YOLO MODEL
+# 🔥 LOAD YOLOv8 MODEL
 # -------------------------------
-yolo_model = torch.hub.load(
-    'ultralytics/yolov5',
-    'custom',
-    path='model/best.pt',
-    force_reload=False
-)
+yolo_model = YOLO("model/best.pt")
 
 # -------------------------------
 # 🔥 LOAD EFFICIENTNET MODEL
 # -------------------------------
 classifier = models.efficientnet_b0(pretrained=False)
 classifier.classifier[1] = torch.nn.Linear(classifier.classifier[1].in_features, 2)
-classifier.load_state_dict(torch.load('model/efficientnet_b0_best.pth', map_location='cpu'))
+classifier.load_state_dict(torch.load("model/efficientnet_b0_best.pth", map_location="cpu"))
 classifier.eval()
 
 transform = transforms.Compose([
@@ -42,18 +37,15 @@ transform = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-# -------------------------------
-# ROUTE
-# -------------------------------
-@app.route('/', methods=['GET', 'POST'])
+@app.route("/", methods=["GET", "POST"])
 def index():
     image_path = None
     processed_path = None
     good_count = 0
     bad_count = 0
 
-    if request.method == 'POST':
-        file = request.files['image']
+    if request.method == "POST":
+        file = request.files["image"]
 
         if file:
             filename = secure_filename(file.filename)
@@ -63,41 +55,42 @@ def index():
             image_path = filepath
             img = cv2.imread(filepath)
 
-            # 🔥 YOLO Detection
+            # 🔥 YOLOv8 Detection
             results = yolo_model(img)
-            boxes = results.xyxy[0]
 
-            for box in boxes:
-                x1, y1, x2, y2, conf, cls = box.tolist()
-                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            for result in results:
+                boxes = result.boxes
 
-                crop = img[y1:y2, x1:x2]
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                if crop.size == 0:
-                    continue
+                    crop = img[y1:y2, x1:x2]
 
-                crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                crop_tensor = transform(crop_pil).unsqueeze(0)
+                    if crop.size == 0:
+                        continue
 
-                with torch.no_grad():
-                    output = classifier(crop_tensor)
-                    _, pred = torch.max(output, 1)
+                    crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                    crop_tensor = transform(crop_pil).unsqueeze(0)
 
-                # 0 = Good , 1 = Bad (adjust if needed)
-                if pred.item() == 0:
-                    label = "Good"
-                    color = (0, 255, 0)
-                    good_count += 1
-                else:
-                    label = "Bad"
-                    color = (0, 0, 255)
-                    bad_count += 1
+                    with torch.no_grad():
+                        output = classifier(crop_tensor)
+                        _, pred = torch.max(output, 1)
 
-                # Draw bounding box
-                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(img, label, (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8, color, 2)
+                    # Adjust if your labels reversed
+                    if pred.item() == 0:
+                        label = "Good"
+                        color = (0, 255, 0)
+                        good_count += 1
+                    else:
+                        label = "Bad"
+                        color = (0, 0, 255)
+                        bad_count += 1
+
+                    # Draw bounding box
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(img, label, (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8, color, 2)
 
             # Save processed image
             processed_filename = "processed_" + filename
@@ -112,3 +105,4 @@ def index():
                            good_count=good_count,
                            bad_count=bad_count)
 
+# DO NOT use app.run() for Render
