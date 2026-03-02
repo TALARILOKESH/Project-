@@ -13,6 +13,11 @@
         <button type="submit">Predict</button>
     </form>
 
+    {% if image_path %}
+        <h3>Uploaded Image:</h3>
+        <img src="{{ image_path }}" width="300">
+    {% endif %}
+
     {% if prediction %}
         <div class="result {{ color_class }}">
             Tomato is {{ prediction }}
