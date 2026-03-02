@@ -1,2 +1,7 @@
-Flask==2.3.3
+Flask
 gunicorn
+torch
+torchvision
+opencv-python-headless
+numpy
+Pillow
