@@ -1,9 +1,11 @@
-Flask
 gunicorn
-torch
-torchvision
-opencv-python-headless
-numpy
 Pillow
 pandas
 ultralytics
+flask
+flask-cors
+torch
+torchvision
+ultralytics
+opencv-python-headless
+numpy
