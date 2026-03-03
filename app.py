@@ -9,13 +9,23 @@ import io
 import os
 import gc
 
+# ----------------------------
+# MEMORY OPTIMIZATION
+# ----------------------------
+torch.set_grad_enabled(False)
+torch.backends.cudnn.enabled = False
+torch.backends.cudnn.benchmark = False
+
+# ----------------------------
+# APP INIT
+# ----------------------------
 app = Flask(__name__)
 CORS(app)
 
 # ----------------------------
 # CONFIG
 # ----------------------------
-IMAGE_SIZE_YOLO = 256   # reduced for lower RAM
+IMAGE_SIZE_YOLO = 256
 IMAGE_SIZE_EFF = 224
 CLASS_NAMES = ["Bad Tomato", "Good Tomato"]
 
@@ -27,13 +37,15 @@ YOLO_PATH = os.path.join(BASE_DIR, "model", "best.pt")
 EFF_PATH = os.path.join(BASE_DIR, "model", "efficientnet_scripted.pt")
 
 # ----------------------------
-# LOAD MODELS (ONCE)
+# LOAD MODELS (CPU ONLY)
 # ----------------------------
 print("Loading YOLO model...")
 yolo_model = YOLO(YOLO_PATH)
-yolo_model.fuse()   # reduce memory slightly
+yolo_model.to("cpu")      # force CPU
+yolo_model.fuse()
+yolo_model.model.eval()   # ensure eval mode
 
-print("Loading TorchScript EfficientNet...")
+print("Loading EfficientNet TorchScript...")
 efficient_model = torch.jit.load(EFF_PATH, map_location="cpu")
 efficient_model.eval()
 
@@ -64,7 +76,13 @@ def detect():
         image_np = cv2.resize(image_np, (IMAGE_SIZE_YOLO, IMAGE_SIZE_YOLO))
 
         # YOLO Detection
-        results = yolo_model(image_np, imgsz=IMAGE_SIZE_YOLO, verbose=False)
+        with torch.inference_mode():
+            results = yolo_model(
+                image_np,
+                imgsz=IMAGE_SIZE_YOLO,
+                verbose=False,
+                device="cpu"
+            )
 
         if len(results[0].boxes) == 0:
             return jsonify({"result": "No Tomato Detected"})
@@ -81,17 +99,20 @@ def detect():
         cropped = cv2.resize(cropped, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
         cropped = cropped.astype("float32") / 255.0
         cropped = np.transpose(cropped, (2, 0, 1))
-        input_tensor = torch.tensor(cropped).unsqueeze(0)
+        input_tensor = torch.from_numpy(cropped).unsqueeze(0)
 
         with torch.inference_mode():
             output = efficient_model(input_tensor)
             predicted = torch.argmax(output, dim=1).item()
 
-        gc.collect()  # free memory
+        # Force cleanup
+        del results, input_tensor
+        gc.collect()
 
         return jsonify({"result": CLASS_NAMES[predicted]})
 
     except Exception as e:
+        gc.collect()8iji
         return jsonify({"error": str(e)}), 500
 
 

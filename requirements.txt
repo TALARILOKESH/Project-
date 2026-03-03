@@ -1,9 +1,9 @@
 flask
 flask-cors
-gunicorn
 ultralytics
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
 opencv-python-headless
 numpy
 Pillow
-torch --index-url https://download.pytorch.org/whl/cpu
-torchvision --index-url https://download.pytorch.org/whl/cpu
+gunicorn
