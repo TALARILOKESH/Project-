@@ -1,162 +1,76 @@
-from flask import Flask, request, render_template_string, send_from_directory
-import os
-import time
-import cv2
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from ultralytics import YOLO
 import torch
-from ultralytics import YOLO
-from torchvision import models, transforms
-from PIL import Imaget transforms, models
+import torch.nn as nn
+import torchvision.transforms as transforms
+import cv2
+import numpy as np
 from PIL import Image
-from ultralytics import YOLO
-from werkzeug.utils import secure_filename
-# ================= CONFIG =================
-YOLO_MODEL_PATH = "model/best.pt"
-EFF_MODEL_PATH = "model/efficientnet_b0_best.pth"
-
-CLASS_MAP = {0: "BAD", 1: "GOOD"}
-NUM_CLASSES = 2
-CONF_THRESHOLD = 0.75
-
-UPLOAD_DIR = "uploads"
-RESULT_DIR = "results"
-
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(RESULT_DIR, exist_ok=True)
-
-# =========================================
+import io
 
 app = Flask(__name__)
+CORS(app)
 
-# -------- Load Models ONCE --------
-print("Loading YOLO model...")
-yolo = YOLO(YOLO_MODEL_PATH)
+# -----------------------------
+# Load YOLO Model
+# -----------------------------
+yolo_model = YOLO("yolo_best.pt")
 
-print("Loading EfficientNet model...")
-eff_model = models.efficientnet_b0(weights=None)
-eff_model.classifier[1] = torch.nn.Linear(
-    eff_model.classifier[1].in_features, NUM_CLASSES
-)
-eff_model.load_state_dict(torch.load(EFF_MODEL_PATH, map_location="cpu"))
-eff_model.eval()
+# -----------------------------
+# Load EfficientNet Model
+# -----------------------------
+class_names = ["Bad Tomato", "Good Tomato"]  # Change if needed
 
-# -------- Preprocessing --------
+device = torch.device("cpu")
+
+efficient_model = torch.load("efficientnet_b0_best.pth", map_location=device)
+efficient_model.eval()
+
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
 ])
 
-# -------- HTML --------
-HTML = """
-<!doctype html>
-<title>Tomato Quality Detection</title>
+# -----------------------------
+# API Route
+# -----------------------------
+@app.route("/detect", methods=["POST"])
+def detect():
 
-<h2>🍅 Tomato Quality Detection</h2>
-
-<form method="post" action="/upload" enctype="multipart/form-data">
-  <input type="file" name="image" required>
-  <br><br>
-  <button type="submit">Analyze</button>
-</form>
-
-{% if result %}
-<hr>
-<h3>{{ result }}</h3>
-<img src="{{ image_path }}" width="500">
-<br><br>
-<a href="/">Analyze another image</a>
-{% endif %}
-"""
-
-# -------- Routes --------
-@app.route("/")
-def home():
-    return render_template_string(HTML)
-
-@app.route("/results/<path:filename>")
-def serve_results(filename):
-    return send_from_directory(RESULT_DIR, filename)
-
-@app.route("/upload", methods=["POST"])
-def upload():
     if "image" not in request.files:
-        return "<h3>No image selected</h3><a href='/'>Go back</a>"
+        return jsonify({"error": "No image uploaded"})
 
-    file = request.files["image"]
-    if file.filename == "":
-        return "<h3>No image selected</h3><a href='/'>Go back</a>"
+    file = request.files["image"].read()
+    image = Image.open(io.BytesIO(file)).convert("RGB")
+    image_np = np.array(image)
 
-    timestamp = int(time.time() * 1000)
-    img_path = os.path.join(UPLOAD_DIR, f"{timestamp}.jpg")
-    file.save(img_path)
+    # -------- YOLO Detection --------
+    results = yolo_model(image_np)
 
-    frame = cv2.imread(img_path)
+    if len(results[0].boxes) == 0:
+        return jsonify({"result": "No Tomato Detected"})
 
-    # 🔥 Resize to reduce memory
-    frame = cv2.resize(frame, (640, 640))
+    # Get first detected box
+    box = results[0].boxes.xyxy[0].cpu().numpy()
+    x1, y1, x2, y2 = map(int, box)
 
-    results = yolo.predict(
-        source=frame,
-        imgsz=416,
-        conf=0.4,
-        verbose=False
-    )[0]
+    cropped = image_np[y1:y2, x1:x2]
 
-    detected = good_count = bad_count = 0
+    # -------- EfficientNet Classification --------
+    cropped_pil = Image.fromarray(cropped)
+    input_tensor = transform(cropped_pil).unsqueeze(0)
 
-    for box in results.boxes:
-        cls_id = int(box.cls[0])
+    with torch.no_grad():
+        output = efficient_model(input_tensor)
+        predicted = torch.argmax(output, 1).item()
 
-        if yolo.names[cls_id].lower() != "tomato":
-            continue
+    result_label = class_names[predicted]
 
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            continue
+    return jsonify({
+        "result": result_label
+    })
 
-        pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-        tensor = transform(pil_img).unsqueeze(0)
 
-        with torch.no_grad():
-            probs = torch.softmax(eff_model(tensor), dim=1)
-            pred = torch.argmax(probs, dim=1).item()
-            conf = probs[0][pred].item()
-
-        if conf < CONF_THRESHOLD:
-            continue
-
-        quality = CLASS_MAP[pred]
-        color = (0, 255, 0) if quality == "GOOD" else (0, 0, 255)
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            frame,
-            f"{quality} {conf:.2f}",
-            (x1, max(y1 - 10, 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2
-        )
-
-        detected += 1
-        if quality == "GOOD":
-            good_count += 1
-        else:
-            bad_count += 1
-
-    if detected == 0:
-        return "<h3>No tomatoes detected ❌</h3><a href='/'>Try again</a>"
-
-    final_img = f"final_{timestamp}.jpg"
-    cv2.imwrite(f"{RESULT_DIR}/{final_img}", frame)
-
-    return render_template_string(
-        HTML,
-        result=f"Detected {detected} | GOOD: {good_count} | BAD: {bad_count}",
-        image_path=f"/results/{final_img}"
-    )
+if __name__ == "__main__":
+    app.run()
