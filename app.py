@@ -1,128 +1,103 @@
+import os
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 from ultralytics import YOLO
 import torch
 import torch.nn as nn
-import torchvision.models as models
 import cv2
 import numpy as np
+from torchvision import models, transforms
 from PIL import Image
-import io
-import os
 
 app = Flask(__name__)
-CORS(app)
 
-# ----------------------------
-# CONFIG
-# ----------------------------
-IMAGE_SIZE_YOLO = 320
-IMAGE_SIZE_EFF = 224
-CLASS_NAMES = ["Bad Tomato", "Good Tomato"]
-
-# ----------------------------
-# PATH SETUP
-# ----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-YOLO_PATH = os.path.join(BASE_DIR, "model", "best.pt")
+# 🔥 USE LIGHTWEIGHT YOLO (not your heavy best.pt)
+YOLO_PATH = "yolov8n.pt"
+
+# ✅ KEEP YOUR EfficientNet PATH EXACTLY SAME
 EFF_PATH = os.path.join(BASE_DIR, "model", "efficientnet_b0_best.pth")
 
-# ----------------------------
-# LOAD YOLO MODEL
-# ----------------------------
-print("Loading YOLO model...")
-yolo_model = YOLO(YOLO_PATH)
-
-# ----------------------------
-# LOAD EFFICIENTNET MODEL (state_dict)
-# ----------------------------
-print("Loading EfficientNet model...")
-
+# 🔥 Disable gradients (huge RAM save)
+torch.set_grad_enabled(False)
 device = torch.device("cpu")
 
-# Recreate EfficientNet-B0 architecture
-efficient_model = models.efficientnet_b0(weights=None)
+# ==========================
+# 1️⃣ LOAD YOLO (Nano Version)
+# ==========================
+yolo_model = YOLO(YOLO_PATH)
+yolo_model.fuse = False   # prevent memory spike
 
-# Modify classifier to match your training (2 classes)
-efficient_model.classifier[1] = nn.Linear(
-    efficient_model.classifier[1].in_features,
+# ==========================
+# 2️⃣ LOAD YOUR EfficientNet (.pth)
+# ==========================
+classifier_model = models.efficientnet_b0(weights=None)
+
+classifier_model.classifier[1] = nn.Linear(
+    classifier_model.classifier[1].in_features,
     2
 )
 
-# Load state_dict weights
-efficient_model.load_state_dict(
+classifier_model.load_state_dict(
     torch.load(EFF_PATH, map_location=device)
 )
 
-efficient_model.eval()
+classifier_model.to(device)
+classifier_model.eval()
 
-print("Models Loaded Successfully ✅")
+# ==========================
+# 3️⃣ IMAGE TRANSFORM
+# ==========================
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
 
-# ----------------------------
-# ROUTE
-# ----------------------------
-@app.route("/", methods=["GET"])
-def home():
-    return "Tomato Sorting Backend Running ✅"
-@app.route("/test", methods=["GET"])
-def test():
-    return "TEST ROUTE WORKING"
+# ==========================
+# 4️⃣ ROUTE
+# ==========================
 @app.route("/detect", methods=["POST"])
 def detect():
-
-    if "image" not in request.files:
-        return jsonify({"error": "No image uploaded"}), 400
-
     try:
-        # Read image
-        file_bytes = request.files["image"].read()
-        image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        image_np = np.array(image)
+        file = request.files["image"]
 
-        # Resize before YOLO (IMPORTANT for speed)
-        image_np = cv2.resize(image_np, (IMAGE_SIZE_YOLO, IMAGE_SIZE_YOLO))
+        file_bytes = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-        # ---------------- YOLO DETECTION ----------------
-        results = yolo_model(
-            image_np,
-            imgsz=IMAGE_SIZE_YOLO,
-            conf=0.4,
-            verbose=False
-        )
+        # 🔥 Reduce YOLO input size
+        img_resized = cv2.resize(img, (512, 512))
 
-        if len(results[0].boxes) == 0:
-            return jsonify({"result": "No Tomato Detected"})
+        results = yolo_model(img_resized, imgsz=512, verbose=False)
 
-        # Take first detected box
-        box = results[0].boxes.xyxy[0].cpu().numpy().astype(int)
-        x1, y1, x2, y2 = box
+        output = []
 
-        cropped = image_np[y1:y2, x1:x2]
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-        if cropped.size == 0:
-            return jsonify({"result": "Detection Error"})
+                crop = img[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
 
-        # ---------------- EfficientNet Classification ----------------
-        cropped = cv2.resize(cropped, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
-        cropped = cropped.astype("float32") / 255.0
-        cropped = np.transpose(cropped, (2, 0, 1))  # HWC → CHW
-        input_tensor = torch.tensor(cropped).unsqueeze(0)
+                crop_pil = Image.fromarray(
+                    cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                )
 
-        with torch.inference_mode():
-            output = efficient_model(input_tensor)
-            predicted = torch.argmax(output, dim=1).item()
+                input_tensor = transform(crop_pil).unsqueeze(0).to(device)
 
-        result_label = CLASS_NAMES[predicted]
+                with torch.no_grad():
+                    prediction = classifier_model(input_tensor)
+                    predicted_class = torch.argmax(prediction, dim=1).item()
 
-        return jsonify({"result": result_label})
+                label = "Good" if predicted_class == 0 else "Bad"
+
+                output.append({"label": label})
+
+        return jsonify({"results": output})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# ----------------------------
-# START
-# ----------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=5000)
