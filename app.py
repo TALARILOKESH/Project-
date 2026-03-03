@@ -21,9 +21,14 @@ torch.set_num_interop_threads(1)
 app = Flask(__name__)
 CORS(app)
 
-IMAGE_SIZE_YOLO = 192   # reduced for speed
+IMAGE_SIZE_YOLO = 192
 IMAGE_SIZE_EFF = 224
-CLASS_NAMES = ["BAD", "GOOD"]
+
+# ✅ EXPLICIT CLASS MAPPING
+CLASS_MAP = {
+    0: "BAD",
+    1: "GOOD"
+}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 YOLO_PATH = os.path.join(BASE_DIR, "model", "best.pt")
@@ -62,9 +67,8 @@ def detect():
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     image_np = np.array(image)
 
-    # 🔥 Resize FULL image before YOLO (big speed gain)
+    # Resize full image (speed)
     image_np = cv2.resize(image_np, (512, 512))
-
     original_image = image_np.copy()
 
     # YOLO detection
@@ -87,24 +91,32 @@ def detect():
         if cropped.size == 0:
             continue
 
-        # Faster preprocessing
+        # Preprocess for EfficientNet
         cropped = cv2.resize(cropped, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
         cropped = cropped.astype(np.float32) / 255.0
         cropped = np.transpose(cropped, (2, 0, 1))
         input_tensor = torch.from_numpy(cropped).unsqueeze(0)
 
-        # Faster inference (no softmax first)
+        # Inference
         output = efficient_model(input_tensor)
-        confidence, predicted = torch.max(output, dim=1)
 
-        predicted_class = predicted.item()
+        # Get prediction index
+        predicted_index = torch.argmax(output, dim=1).item()
 
-        # Optional: compute real probability only if needed
-        prob = torch.softmax(output, dim=1)[0][predicted_class].item()
+        # Compute confidence properly
+        probabilities = torch.softmax(output, dim=1)
+        confidence = probabilities[0][predicted_index].item()
 
-        label = f"Tomato: {CLASS_NAMES[predicted_class]} ({prob:.2f})"
+        # ✅ Explicit mapping (0=BAD, 1=GOOD)
+        label_text = CLASS_MAP.get(predicted_index, "UNKNOWN")
 
-        color = (0, 0, 255) if predicted_class == 0 else (0, 255, 0)
+        label = f"Tomato: {label_text} ({confidence:.2f})"
+
+        # Color logic
+        if predicted_index == 0:
+            color = (0, 0, 255)   # RED = BAD
+        else:
+            color = (0, 255, 0)   # GREEN = GOOD
 
         cv2.rectangle(original_image, (x1, y1), (x2, y2), color, 2)
 
