@@ -62,7 +62,9 @@ print("Models Loaded Successfully ✅")
 # ----------------------------
 # ROUTE
 # ----------------------------
-@app.route("/detect", methods=["POST"])
+@app.route("/", methods=["GET"])
+def home():
+    return "Tomato Sorting Backend Running ✅"
 def detect():
 
     if "image" not in request.files:
