@@ -24,10 +24,13 @@ CORS(app)
 IMAGE_SIZE_YOLO = 192
 IMAGE_SIZE_EFF = 224
 
-# ✅ EXPLICIT CLASS MAPPING
+# ✅ CORRECTED CLASS MAPPING
+# Based on your model behaviour:
+# 0 = GOOD
+# 1 = BAD
 CLASS_MAP = {
-    0: "BAD",
-    1: "GOOD"
+    0: "GOOD",
+    1: "BAD"
 }
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,11 +70,11 @@ def detect():
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     image_np = np.array(image)
 
-    # Resize full image (speed)
+    # Resize full image for faster processing
     image_np = cv2.resize(image_np, (512, 512))
     original_image = image_np.copy()
 
-    # YOLO detection
+    # YOLO Detection
     results = yolo_model(
         image_np,
         imgsz=IMAGE_SIZE_YOLO,
@@ -91,45 +94,44 @@ def detect():
         if cropped.size == 0:
             continue
 
-        # Preprocess for EfficientNet
+        # EfficientNet preprocessing
         cropped = cv2.resize(cropped, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
         cropped = cropped.astype(np.float32) / 255.0
         cropped = np.transpose(cropped, (2, 0, 1))
         input_tensor = torch.from_numpy(cropped).unsqueeze(0)
 
-        # Inference
+        # Classification
         output = efficient_model(input_tensor)
-
-        # Get prediction index
-        predicted_index = torch.argmax(output, dim=1).item()
-
-        # Compute confidence properly
         probabilities = torch.softmax(output, dim=1)
+
+        predicted_index = torch.argmax(probabilities, dim=1).item()
         confidence = probabilities[0][predicted_index].item()
 
-        # ✅ Explicit mapping (0=BAD, 1=GOOD)
         label_text = CLASS_MAP.get(predicted_index, "UNKNOWN")
 
         label = f"Tomato: {label_text} ({confidence:.2f})"
 
         # Color logic
-        if predicted_index == 0:
-            color = (0, 0, 255)   # RED = BAD
-        else:
-            color = (0, 255, 0)   # GREEN = GOOD
+        if predicted_index == 1:   # BAD
+            color = (0, 0, 255)    # Red
+        else:                      # GOOD
+            color = (0, 255, 0)    # Green
 
+        # Draw bounding box
         cv2.rectangle(original_image, (x1, y1), (x2, y2), color, 2)
 
+        # Draw label
         cv2.putText(
             original_image,
             label,
-            (x1, y1 - 8),
+            (x1, y1 - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             color,
             2
         )
 
+    # Convert to image response
     result_image = Image.fromarray(original_image)
     img_io = io.BytesIO()
     result_image.save(img_io, format="JPEG", quality=85)
