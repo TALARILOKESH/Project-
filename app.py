@@ -7,7 +7,13 @@ import numpy as np
 from PIL import Image
 import io
 import os
-import gc
+
+# ----------------------------
+# SPEED OPTIMIZATION
+# ----------------------------
+torch.set_grad_enabled(False)
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 # ----------------------------
 # APP INIT
@@ -15,20 +21,10 @@ import gc
 app = Flask(__name__)
 CORS(app)
 
-# ----------------------------
-# CONFIG
-# ----------------------------
-IMAGE_SIZE_YOLO = 256
+IMAGE_SIZE_YOLO = 192   # reduced for speed
 IMAGE_SIZE_EFF = 224
-
-# IMPORTANT:
-# 0 = Bad
-# 1 = Good
 CLASS_NAMES = ["BAD", "GOOD"]
 
-# ----------------------------
-# PATHS
-# ----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 YOLO_PATH = os.path.join(BASE_DIR, "model", "best.pt")
 EFF_PATH = os.path.join(BASE_DIR, "model", "efficientnet_scripted.pt")
@@ -36,7 +32,7 @@ EFF_PATH = os.path.join(BASE_DIR, "model", "efficientnet_scripted.pt")
 # ----------------------------
 # LOAD MODELS
 # ----------------------------
-print("Loading YOLO model...")
+print("Loading YOLO...")
 yolo_model = YOLO(YOLO_PATH)
 yolo_model.to("cpu")
 yolo_model.fuse()
@@ -46,7 +42,7 @@ print("Loading EfficientNet...")
 efficient_model = torch.jit.load(EFF_PATH, map_location="cpu")
 efficient_model.eval()
 
-print("Models Loaded Successfully ✅")
+print("Models Ready ✅")
 
 # ----------------------------
 # ROUTES
@@ -66,16 +62,18 @@ def detect():
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     image_np = np.array(image)
 
+    # 🔥 Resize FULL image before YOLO (big speed gain)
+    image_np = cv2.resize(image_np, (512, 512))
+
     original_image = image_np.copy()
 
-    # YOLO Detection
-    with torch.inference_mode():
-        results = yolo_model(
-            image_np,
-            imgsz=IMAGE_SIZE_YOLO,
-            verbose=False,
-            device="cpu"
-        )
+    # YOLO detection
+    results = yolo_model(
+        image_np,
+        imgsz=IMAGE_SIZE_YOLO,
+        verbose=False,
+        device="cpu"
+    )
 
     if len(results[0].boxes) == 0:
         return "No Tomato Detected", 200
@@ -86,53 +84,44 @@ def detect():
         x1, y1, x2, y2 = box.astype(int)
 
         cropped = image_np[y1:y2, x1:x2]
-
         if cropped.size == 0:
             continue
 
-        # Classification
-        cropped_resized = cv2.resize(cropped, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
-        cropped_resized = cropped_resized.astype("float32") / 255.0
-        cropped_resized = np.transpose(cropped_resized, (2, 0, 1))
-        input_tensor = torch.from_numpy(cropped_resized).unsqueeze(0)
+        # Faster preprocessing
+        cropped = cv2.resize(cropped, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
+        cropped = cropped.astype(np.float32) / 255.0
+        cropped = np.transpose(cropped, (2, 0, 1))
+        input_tensor = torch.from_numpy(cropped).unsqueeze(0)
 
-        with torch.inference_mode():
-            output = efficient_model(input_tensor)
-            probs = torch.softmax(output, dim=1)
-            confidence, predicted = torch.max(probs, dim=1)
+        # Faster inference (no softmax first)
+        output = efficient_model(input_tensor)
+        confidence, predicted = torch.max(output, dim=1)
 
         predicted_class = predicted.item()
-        confidence_score = confidence.item()
 
-        label = f"Tomato: {CLASS_NAMES[predicted_class]} ({confidence_score:.2f})"
+        # Optional: compute real probability only if needed
+        prob = torch.softmax(output, dim=1)[0][predicted_class].item()
 
-        # Color: Red for BAD, Green for GOOD
-        if predicted_class == 0:
-            color = (0, 0, 255)  # Red
-        else:
-            color = (0, 255, 0)  # Green
+        label = f"Tomato: {CLASS_NAMES[predicted_class]} ({prob:.2f})"
 
-        # Draw bounding box
+        color = (0, 0, 255) if predicted_class == 0 else (0, 255, 0)
+
         cv2.rectangle(original_image, (x1, y1), (x2, y2), color, 2)
 
-        # Draw text
         cv2.putText(
             original_image,
             label,
-            (x1, y1 - 10),
+            (x1, y1 - 8),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             color,
             2
         )
 
-    # Convert to image for response
     result_image = Image.fromarray(original_image)
     img_io = io.BytesIO()
-    result_image.save(img_io, format="JPEG")
+    result_image.save(img_io, format="JPEG", quality=85)
     img_io.seek(0)
-
-    gc.collect()
 
     return send_file(img_io, mimetype="image/jpeg")
 
