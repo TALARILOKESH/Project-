@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from ultralytics import YOLO
 import torch
+import torch.nn as nn
+import torchvision.models as models
 import cv2
 import numpy as np
 from PIL import Image
@@ -19,21 +21,40 @@ IMAGE_SIZE_EFF = 224
 CLASS_NAMES = ["Bad Tomato", "Good Tomato"]
 
 # ----------------------------
-# LOAD MODELS ONCE (IMPORTANT)
+# PATH SETUP
 # ----------------------------
-
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-MODEL_PATH = os.path.join(BASE_DIR, "model", "best.pt")
+YOLO_PATH = os.path.join(BASE_DIR, "model", "best.pt")
 EFF_PATH = os.path.join(BASE_DIR, "model", "efficientnet_b0_best.pth")
 
+# ----------------------------
+# LOAD YOLO MODEL
+# ----------------------------
 print("Loading YOLO model...")
-yolo_model = YOLO(MODEL_PATH)
+yolo_model = YOLO(YOLO_PATH)
 
+# ----------------------------
+# LOAD EFFICIENTNET MODEL (state_dict)
+# ----------------------------
 print("Loading EfficientNet model...")
+
 device = torch.device("cpu")
-efficient_model = torch.load(EFF_PATH, map_location=device)
+
+# Recreate EfficientNet-B0 architecture
+efficient_model = models.efficientnet_b0(weights=None)
+
+# Modify classifier to match your training (2 classes)
+efficient_model.classifier[1] = nn.Linear(
+    efficient_model.classifier[1].in_features,
+    2
+)
+
+# Load state_dict weights
+efficient_model.load_state_dict(
+    torch.load(EFF_PATH, map_location=device)
+)
+
 efficient_model.eval()
 
 print("Models Loaded Successfully ✅")
@@ -53,7 +74,7 @@ def detect():
         image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
         image_np = np.array(image)
 
-        # Resize early for speed
+        # Resize before YOLO (IMPORTANT for speed)
         image_np = cv2.resize(image_np, (IMAGE_SIZE_YOLO, IMAGE_SIZE_YOLO))
 
         # ---------------- YOLO DETECTION ----------------
@@ -67,7 +88,7 @@ def detect():
         if len(results[0].boxes) == 0:
             return jsonify({"result": "No Tomato Detected"})
 
-        # Take first detected tomato
+        # Take first detected box
         box = results[0].boxes.xyxy[0].cpu().numpy().astype(int)
         x1, y1, x2, y2 = box
 
