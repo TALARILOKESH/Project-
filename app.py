@@ -4,60 +4,56 @@ from ultralytics import YOLO
 import torch
 import cv2
 import numpy as np
+from PIL import Image
 import io
 import os
 import gc
 
-# ==============================
-# CPU + MEMORY CONTROL
-# ==============================
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-torch.set_grad_enabled(False)
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
-
-cv2.setNumThreads(0)
-cv2.setUseOptimized(True)
-
-# ==============================
+# ----------------------------
 # APP INIT
-# ==============================
+# ----------------------------
 app = Flask(__name__)
 CORS(app)
 
-IMAGE_SIZE_YOLO = 192
+# ----------------------------
+# CONFIG
+# ----------------------------
+IMAGE_SIZE_YOLO = 256
 IMAGE_SIZE_EFF = 224
 
-GOOD_THRESHOLD = 0.75
+# IMPORTANT:
+# 0 = Bad
+# 1 = Good
+CLASS_NAMES = ["BAD", "GOOD"]
 
-CLASS_MAP = {0: "BAD", 1: "GOOD"}
-
+# ----------------------------
+# PATHS
+# ----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 YOLO_PATH = os.path.join(BASE_DIR, "model", "best.pt")
 EFF_PATH = os.path.join(BASE_DIR, "model", "efficientnet_scripted.pt")
 
-# ==============================
+# ----------------------------
 # LOAD MODELS
-# ==============================
-print("Loading YOLO...")
-yolo = YOLO(YOLO_PATH)
-yolo.model.eval()
+# ----------------------------
+print("Loading YOLO model...")
+yolo_model = YOLO(YOLO_PATH)
+yolo_model.to("cpu")
+yolo_model.fuse()
+yolo_model.model.eval()
 
 print("Loading EfficientNet...")
 efficient_model = torch.jit.load(EFF_PATH, map_location="cpu")
 efficient_model.eval()
 
-print("Models Loaded")
+print("Models Loaded Successfully ✅")
 
-# ==============================
+# ----------------------------
 # ROUTES
-# ==============================
+# ----------------------------
 @app.route("/")
 def home():
-    return "Tomato Sorting Backend Running"
+    return "Tomato Sorting Backend Running ✅"
 
 
 @app.route("/detect", methods=["POST"])
@@ -67,178 +63,78 @@ def detect():
         return "No image uploaded", 400
 
     file_bytes = request.files["image"].read()
-    np_img = np.frombuffer(file_bytes, np.uint8)
+    image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    image_np = np.array(image)
 
-    image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    original_image = image_np.copy()
 
-    # ==============================
-    # SMART RESIZE
-    # ==============================
-    h, w = image.shape[:2]
-
-    MAX_DIM = 640
-    scale = MAX_DIM / max(h, w)
-
-    if scale < 1:
-        image = cv2.resize(image, (int(w * scale), int(h * scale)))
-
-    original = image.copy()
-
-    # ==============================
-    # YOLO DETECTION (Improved NMS)
-    # ==============================
+    # YOLO Detection
     with torch.inference_mode():
-
-        results = yolo.predict(
-            image,
+        results = yolo_model(
+            image_np,
             imgsz=IMAGE_SIZE_YOLO,
-            conf=0.30,
-            iou=0.50,
-            max_det=20,
-            device="cpu",
-            verbose=False
+            verbose=False,
+            device="cpu"
         )
 
     if len(results[0].boxes) == 0:
-        return "No Tomato Detected"
+        return "No Tomato Detected", 200
 
-    boxes = results[0].boxes.xyxy.numpy()
+    boxes = results[0].boxes.xyxy.cpu().numpy()
 
-    del results
-    gc.collect()
+    for box in boxes:
+        x1, y1, x2, y2 = box.astype(int)
 
-    crops = []
-    coords = []
+        cropped = image_np[y1:y2, x1:x2]
 
-    H, W = image.shape[:2]
-
-    # ==============================
-    # PREPARE CROPS
-    # ==============================
-    for b in boxes:
-
-        x1, y1, x2, y2 = b.astype(int)
-
-        pad = int(0.05 * max(x2-x1, y2-y1))
-
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-        x2 = min(W, x2 + pad)
-        y2 = min(H, y2 + pad)
-
-        crop = image[y1:y2, x1:x2]
-
-        if crop.size == 0:
+        if cropped.size == 0:
             continue
 
-        # center crop improvement
-        h2, w2 = crop.shape[:2]
-        margin = int(0.1 * min(h2, w2))
-
-        crop = crop[margin:h2-margin, margin:w2-margin]
-
-        crop = cv2.resize(crop, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
-
-        crop = crop.astype(np.float32) / 255.0
-
-        # EfficientNet normalization
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-
-        crop = (crop - mean) / std
-
-        crop = np.transpose(crop, (2,0,1))
-
-        crops.append(crop)
-        coords.append((x1,y1,x2,y2))
-
-    if len(crops) == 0:
-        return "No valid crop"
-
-    preds = []
-    probs = []
-
-    BATCH = 4
-
-    # ==============================
-    # CLASSIFICATION + TTA
-    # ==============================
-    for i in range(0,len(crops),BATCH):
-
-        batch = torch.tensor(crops[i:i+BATCH])
-
-        batch_flip_h = torch.flip(batch, dims=[3])
-        batch_flip_v = torch.flip(batch, dims=[2])
+        # Classification
+        cropped_resized = cv2.resize(cropped, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
+        cropped_resized = cropped_resized.astype("float32") / 255.0
+        cropped_resized = np.transpose(cropped_resized, (2, 0, 1))
+        input_tensor = torch.from_numpy(cropped_resized).unsqueeze(0)
 
         with torch.inference_mode():
+            output = efficient_model(input_tensor)
+            probs = torch.softmax(output, dim=1)
+            confidence, predicted = torch.max(probs, dim=1)
 
-            out1 = efficient_model(batch)
-            out2 = efficient_model(batch_flip_h)
-            out3 = efficient_model(batch_flip_v)
+        predicted_class = predicted.item()
+        confidence_score = confidence.item()
 
-            p = (
-                torch.softmax(out1, dim=1) +
-                torch.softmax(out2, dim=1) +
-                torch.softmax(out3, dim=1)
-            ) / 3
+        label = f"Tomato: {CLASS_NAMES[predicted_class]} ({confidence_score:.2f})"
 
-        pr = torch.argmax(p, dim=1)
+        # Color: Red for BAD, Green for GOOD
+        if predicted_class == 0:
+            color = (0, 0, 255)  # Red
+        else:
+            color = (0, 255, 0)  # Green
 
-        preds.extend(pr.tolist())
-        probs.extend(p.tolist())
+        # Draw bounding box
+        cv2.rectangle(original_image, (x1, y1), (x2, y2), color, 2)
 
-        del batch
-        del out1
-        del out2
-        del out3
-        gc.collect()
-
-    # ==============================
-    # DRAW RESULTS
-    # ==============================
-    for i,(x1,y1,x2,y2) in enumerate(coords):
-
-        pred = preds[i]
-        prob = probs[i][pred]
-
-        if pred == 1 and prob < GOOD_THRESHOLD:
-            pred = 0
-
-        label = f"Tomato: {CLASS_MAP[pred]} ({prob:.2f})"
-
-        color = (0,0,255) if pred == 0 else (0,255,0)
-
-        cv2.rectangle(original,(x1,y1),(x2,y2),color,2)
-
+        # Draw text
         cv2.putText(
-            original,
+            original_image,
             label,
-            (x1,y1-10),
+            (x1, y1 - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             color,
             2
         )
 
-    # ==============================
-    # RETURN IMAGE
-    # ==============================
-    success, buffer = cv2.imencode(
-    ".jpg",
-    cv2.cvtColor(original, cv2.COLOR_RGB2BGR),
-    [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-)
+    # Convert to image for response
+    result_image = Image.fromarray(original_image)
+    img_io = io.BytesIO()
+    result_image.save(img_io, format="JPEG")
+    img_io.seek(0)
 
-if not success:
-    return "Image encoding failed", 500
+    gc.collect()
 
-return send_file(
-    io.BytesIO(buffer.tobytes()),
-    mimetype="image/jpeg",
-    as_attachment=False,
-    download_name="result.jpg"
-)
+    return send_file(img_io, mimetype="image/jpeg")
 
 
 if __name__ == "__main__":
