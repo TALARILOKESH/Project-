@@ -224,13 +224,21 @@ def detect():
     # ==============================
     # RETURN IMAGE
     # ==============================
-    _, buffer = cv2.imencode(
-        ".jpg",
-        cv2.cvtColor(original, cv2.COLOR_RGB2BGR),
-        [int(cv2.IMWRITE_JPEG_QUALITY),80]
-    )
+    success, buffer = cv2.imencode(
+    ".jpg",
+    cv2.cvtColor(original, cv2.COLOR_RGB2BGR),
+    [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+)
 
-    return send_file(io.BytesIO(buffer), mimetype="image/jpeg")
+if not success:
+    return "Image encoding failed", 500
+
+return send_file(
+    io.BytesIO(buffer.tobytes()),
+    mimetype="image/jpeg",
+    as_attachment=False,
+    download_name="result.jpg"
+)
 
 
 if __name__ == "__main__":
