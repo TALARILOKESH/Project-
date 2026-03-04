@@ -8,7 +8,7 @@ import io
 import os
 
 # ----------------------------
-# CPU CONTROL
+# CPU CONTROL (Render stability)
 # ----------------------------
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -30,11 +30,11 @@ CORS(app)
 IMAGE_SIZE_YOLO = 192
 IMAGE_SIZE_EFF = 224
 
-# REQUIRED CLASS MAPPING
-CLASS_MAP = {
-    0: "BAD",
-    1: "GOOD"
-}
+# classification threshold
+GOOD_THRESHOLD = 0.60
+
+# class mapping
+CLASS_MAP = {0: "BAD", 1: "GOOD"}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 YOLO_PATH = os.path.join(BASE_DIR, "model", "best.pt")
@@ -67,9 +67,7 @@ def detect():
     if "image" not in request.files:
         return "No image", 400
 
-    # ----------------------------
     # FAST IMAGE LOAD
-    # ----------------------------
     file_bytes = request.files["image"].read()
     np_img = np.frombuffer(file_bytes, np.uint8)
 
@@ -77,11 +75,11 @@ def detect():
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     # ----------------------------
-    # SMART RESIZE
+    # SMART RESIZE (large images)
     # ----------------------------
     h, w = image.shape[:2]
 
-    MAX_DIM = 512
+    MAX_DIM = 640
     scale = MAX_DIM / max(h, w)
 
     if scale < 1:
@@ -119,8 +117,9 @@ def detect():
 
         x1, y1, x2, y2 = b.astype(int)
 
-        # Add small padding for better classification
-        pad = 5
+        # adaptive padding
+        pad = int(0.05 * max(x2-x1, y2-y1))
+
         x1 = max(0, x1 - pad)
         y1 = max(0, y1 - pad)
         x2 = min(W, x2 + pad)
@@ -134,44 +133,57 @@ def detect():
         crop = cv2.resize(crop, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
 
         crop = crop.astype(np.float32) / 255.0
-        crop = np.transpose(crop, (2, 0, 1))
+        crop = np.transpose(crop, (2,0,1))
 
         crops.append(crop)
-        coords.append((x1, y1, x2, y2))
+        coords.append((x1,y1,x2,y2))
 
     if len(crops) == 0:
         return "No valid crop"
 
     # ----------------------------
-    # BATCH CLASSIFICATION
+    # MEMORY SAFE CLASSIFICATION
     # ----------------------------
-    batch = torch.from_numpy(np.array(crops))
+    preds = []
+    probs = []
 
-    with torch.inference_mode():
-        out = efficient_model(batch)
+    BATCH = 4
 
-    probs = torch.softmax(out, dim=1)
-    preds = torch.argmax(probs, dim=1)
+    for i in range(0,len(crops),BATCH):
+
+        batch = torch.from_numpy(np.array(crops[i:i+BATCH]))
+
+        with torch.inference_mode():
+            out = efficient_model(batch)
+
+        p = torch.softmax(out,dim=1)
+        pr = torch.argmax(p,dim=1)
+
+        preds.extend(pr.tolist())
+        probs.extend(p.tolist())
 
     # ----------------------------
     # DRAW RESULTS
     # ----------------------------
-    for i, (x1, y1, x2, y2) in enumerate(coords):
+    for i,(x1,y1,x2,y2) in enumerate(coords):
 
-        p = preds[i].item()
-        prob = probs[i][p].item()
+        pred = preds[i]
+        prob = probs[i][pred]
 
-        label = f"Tomato: {CLASS_MAP[p]} ({prob:.2f})"
+        # apply classification threshold
+        if pred == 1 and prob < GOOD_THRESHOLD:
+            pred = 0
 
-        # Correct color mapping
-        color = (0, 0, 255) if p == 0 else (0, 255, 0)
+        label = f"Tomato: {CLASS_MAP[pred]} ({prob:.2f})"
 
-        cv2.rectangle(original, (x1, y1), (x2, y2), color, 2)
+        color = (0,0,255) if pred == 0 else (0,255,0)
+
+        cv2.rectangle(original,(x1,y1),(x2,y2),color,2)
 
         cv2.putText(
             original,
             label,
-            (x1, y1 - 10),
+            (x1,y1-10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             color,
@@ -179,16 +191,16 @@ def detect():
         )
 
     # ----------------------------
-    # FAST RETURN
+    # RETURN IMAGE
     # ----------------------------
-    _, buffer = cv2.imencode(
+    _,buffer = cv2.imencode(
         ".jpg",
-        cv2.cvtColor(original, cv2.COLOR_RGB2BGR),
-        [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+        cv2.cvtColor(original,cv2.COLOR_RGB2BGR),
+        [int(cv2.IMWRITE_JPEG_QUALITY),80]
     )
 
     return send_file(io.BytesIO(buffer), mimetype="image/jpeg")
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=10000)
