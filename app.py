@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, make_response
 from flask_cors import CORS
 from ultralytics import YOLO
 import torch
@@ -32,6 +32,9 @@ YOLO_SIZE = 256
 EFF_SIZE = 224
 MAX_IMAGE_DIM = 640
 MAX_TOMATOES = 8
+
+# Upload protection (avoid RAM spike)
+MAX_UPLOAD_SIZE = 5 * 1024 * 1024  # 5MB limit
 
 CLASS_MAP = {0: "BAD", 1: "GOOD"}
 
@@ -88,7 +91,43 @@ def detect():
         if "image" not in request.files:
             return "No image uploaded", 400
 
-        file_bytes = request.files["image"].read()
+        file = request.files["image"]
+
+        # ==========================
+        # FILE SIZE PROTECTION
+        # ==========================
+
+        file.seek(0, os.SEEK_END)
+        file_length = file.tell()
+        file.seek(0)
+
+        if file_length > MAX_UPLOAD_SIZE:
+
+            blank = np.zeros((400,600,3), dtype=np.uint8)
+
+            cv2.putText(
+                blank,
+                "Image Too Large",
+                (150,200),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0,0,255),
+                2
+            )
+
+            img = Image.fromarray(blank)
+
+            img_io = io.BytesIO()
+            img.save(img_io, format="JPEG")
+            img_io.seek(0)
+
+            response = make_response(send_file(img_io, mimetype="image/jpeg"))
+            response.headers["X-Good-Tomatoes"] = "0"
+            response.headers["X-Bad-Tomatoes"] = "0"
+
+            return response
+
+        file_bytes = file.read()
 
         image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
         image = np.array(image)
@@ -96,6 +135,9 @@ def detect():
         image = smart_resize(image)
 
         original = image.copy()
+
+        good_count = 0
+        bad_count = 0
 
         # ==========================
         # YOLO DETECTION
@@ -161,6 +203,15 @@ def detect():
                 pred = pred.item()
                 conf = conf.item()
 
+                # ==========================
+                # COUNT GOOD / BAD
+                # ==========================
+
+                if pred == 1:
+                    good_count += 1
+                else:
+                    bad_count += 1
+
                 label = f"Tomato: {CLASS_MAP[pred]} ({conf:.2f})"
 
                 color = (0,0,255) if pred == 0 else (0,255,0)
@@ -183,7 +234,7 @@ def detect():
                 count += 1
 
         # ==========================
-        # RETURN IMAGE
+        # RETURN IMAGE + COUNTS
         # ==========================
 
         result = Image.fromarray(original)
@@ -196,7 +247,12 @@ def detect():
 
         gc.collect()
 
-        return send_file(img_io, mimetype="image/jpeg")
+        response = make_response(send_file(img_io, mimetype="image/jpeg"))
+
+        response.headers["X-Good-Tomatoes"] = str(good_count)
+        response.headers["X-Bad-Tomatoes"] = str(bad_count)
+
+        return response
 
     except Exception as e:
 
@@ -222,7 +278,12 @@ def detect():
 
         img_io.seek(0)
 
-        return send_file(img_io, mimetype="image/jpeg")
+        response = make_response(send_file(img_io, mimetype="image/jpeg"))
+
+        response.headers["X-Good-Tomatoes"] = "0"
+        response.headers["X-Bad-Tomatoes"] = "0"
+
+        return response
 
 
 if __name__ == "__main__":
