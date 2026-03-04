@@ -30,7 +30,7 @@ CORS(app)
 IMAGE_SIZE_YOLO = 192
 IMAGE_SIZE_EFF = 224
 
-CLASS_MAP = {0: "GOOD", 1: "BAD"}
+CLASS_MAP = {0: "BAD", 1: "GOOD"}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 YOLO_PATH = os.path.join(BASE_DIR, "model", "best.pt")
