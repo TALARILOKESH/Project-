@@ -9,59 +9,56 @@ import io
 import os
 import gc
 
-# =====================================
-# CPU + MEMORY CONTROL (Render Safe)
-# =====================================
+# ==========================
+# CPU + MEMORY CONTROL
+# ==========================
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
 torch.set_grad_enabled(False)
 torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
 
 cv2.setNumThreads(0)
 
-# =====================================
+# ==========================
 # APP INIT
-# =====================================
+# ==========================
 
 app = Flask(__name__)
 CORS(app)
 
 YOLO_SIZE = 256
 EFF_SIZE = 224
-
 MAX_IMAGE_DIM = 640
+MAX_TOMATOES = 8
 
 CLASS_MAP = {0: "BAD", 1: "GOOD"}
-
-# =====================================
-# PATHS
-# =====================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 YOLO_PATH = os.path.join(BASE_DIR, "model", "best.pt")
 EFF_PATH = os.path.join(BASE_DIR, "model", "efficientnet_scripted.pt")
 
-# =====================================
-# LOAD MODELS ONCE
-# =====================================
+# ==========================
+# LOAD MODELS
+# ==========================
 
 print("Loading YOLO...")
 yolo = YOLO(YOLO_PATH)
+
+# Reduce YOLO memory usage
+yolo.model.fuse()
 
 print("Loading EfficientNet...")
 efficient_model = torch.jit.load(EFF_PATH, map_location="cpu")
 efficient_model.eval()
 
-print("Models Loaded Successfully ✅")
+print("Models Ready ✅")
 
-
-# =====================================
-# SMART RESIZE FUNCTION
-# =====================================
+# ==========================
+# SMART RESIZE
+# ==========================
 
 def smart_resize(image):
 
@@ -70,14 +67,13 @@ def smart_resize(image):
     scale = MAX_IMAGE_DIM / max(h, w)
 
     if scale < 1:
-        image = cv2.resize(image, (int(w * scale), int(h * scale)))
+        image = cv2.resize(image, (int(w*scale), int(h*scale)))
 
     return image
 
-
-# =====================================
+# ==========================
 # ROUTES
-# =====================================
+# ==========================
 
 @app.route("/")
 def home():
@@ -92,10 +88,6 @@ def detect():
         if "image" not in request.files:
             return "No image uploaded", 400
 
-        # =====================================
-        # LOAD IMAGE
-        # =====================================
-
         file_bytes = request.files["image"].read()
 
         image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
@@ -105,9 +97,9 @@ def detect():
 
         original = image.copy()
 
-        # =====================================
+        # ==========================
         # YOLO DETECTION
-        # =====================================
+        # ==========================
 
         with torch.inference_mode():
 
@@ -115,6 +107,7 @@ def detect():
                 image,
                 imgsz=YOLO_SIZE,
                 conf=0.30,
+                max_det=MAX_TOMATOES,
                 device="cpu",
                 verbose=False
             )
@@ -135,14 +128,12 @@ def detect():
 
             boxes = results[0].boxes.xyxy.cpu().numpy()
 
-            crops = []
-            coords = []
-
-            # =====================================
-            # CROP TOMATOES
-            # =====================================
+            count = 0
 
             for box in boxes:
+
+                if count >= MAX_TOMATOES:
+                    break
 
                 x1, y1, x2, y2 = map(int, box)
 
@@ -157,64 +148,43 @@ def detect():
 
                 crop = np.transpose(crop, (2,0,1))
 
-                crops.append(crop)
-                coords.append((x1,y1,x2,y2))
-
-            if len(crops) > 0:
-
-                batch = torch.tensor(crops)
-
-                # =====================================
-                # BATCH CLASSIFICATION (FAST)
-                # =====================================
+                tensor = torch.from_numpy(crop).unsqueeze(0)
 
                 with torch.inference_mode():
 
-                    outputs = efficient_model(batch)
+                    output = efficient_model(tensor)
 
-                    probs = torch.softmax(outputs, dim=1)
+                    probs = torch.softmax(output, dim=1)
 
-                    confs, preds = torch.max(probs, 1)
+                    conf, pred = torch.max(probs, 1)
 
-                preds = preds.tolist()
-                confs = confs.tolist()
+                pred = pred.item()
+                conf = conf.item()
 
-                # =====================================
-                # DRAW BOXES
-                # =====================================
+                label = f"Tomato: {CLASS_MAP[pred]} ({conf:.2f})"
 
-                for i,(x1,y1,x2,y2) in enumerate(coords):
+                color = (0,0,255) if pred == 0 else (0,255,0)
 
-                    pred = preds[i]
-                    conf = confs[i]
+                cv2.rectangle(original,(x1,y1),(x2,y2),color,2)
 
-                    label = f"Tomato: {CLASS_MAP[pred]} ({conf:.2f})"
+                cv2.putText(
+                    original,
+                    label,
+                    (x1,y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2
+                )
 
-                    color = (0,0,255) if pred == 0 else (0,255,0)
+                del tensor
+                gc.collect()
 
-                    cv2.rectangle(original,(x1,y1),(x2,y2),color,2)
+                count += 1
 
-                    cv2.putText(
-                        original,
-                        label,
-                        (x1,y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        color,
-                        2
-                    )
-
-                del batch
-
-        # =====================================
-        # MEMORY CLEANUP
-        # =====================================
-
-        gc.collect()
-
-        # =====================================
+        # ==========================
         # RETURN IMAGE
-        # =====================================
+        # ==========================
 
         result = Image.fromarray(original)
 
@@ -224,16 +194,18 @@ def detect():
 
         img_io.seek(0)
 
+        gc.collect()
+
         return send_file(img_io, mimetype="image/jpeg")
 
     except Exception as e:
 
         print("ERROR:", e)
 
-        error_img = np.zeros((400,600,3), dtype=np.uint8)
+        blank = np.zeros((400,600,3), dtype=np.uint8)
 
         cv2.putText(
-            error_img,
+            blank,
             "Server Error",
             (160,200),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -242,7 +214,7 @@ def detect():
             2
         )
 
-        img = Image.fromarray(error_img)
+        img = Image.fromarray(blank)
 
         img_io = io.BytesIO()
 
