@@ -9,7 +9,7 @@ import io
 import os
 
 # ----------------------------
-# SPEED OPTIMIZATION
+# SPEED SETTINGS
 # ----------------------------
 torch.set_grad_enabled(False)
 torch.set_num_threads(1)
@@ -24,10 +24,7 @@ CORS(app)
 IMAGE_SIZE_YOLO = 192
 IMAGE_SIZE_EFF = 224
 
-# ✅ CORRECTED CLASS MAPPING
-# Based on your model behaviour:
-# 0 = GOOD
-# 1 = BAD
+# model class mapping
 CLASS_MAP = {
     0: "GOOD",
     1: "BAD"
@@ -70,11 +67,13 @@ def detect():
     image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     image_np = np.array(image)
 
-    # Resize full image for faster processing
+    # Resize once for faster processing
     image_np = cv2.resize(image_np, (512, 512))
     original_image = image_np.copy()
 
-    # YOLO Detection
+    # ----------------------------
+    # YOLO DETECTION
+    # ----------------------------
     results = yolo_model(
         image_np,
         imgsz=IMAGE_SIZE_YOLO,
@@ -87,6 +86,12 @@ def detect():
 
     boxes = results[0].boxes.xyxy.cpu().numpy()
 
+    # ----------------------------
+    # PREPARE CROPS FOR BATCH CLASSIFICATION
+    # ----------------------------
+    crops = []
+    valid_boxes = []
+
     for box in boxes:
         x1, y1, x2, y2 = box.astype(int)
 
@@ -94,33 +99,41 @@ def detect():
         if cropped.size == 0:
             continue
 
-        # EfficientNet preprocessing
         cropped = cv2.resize(cropped, (IMAGE_SIZE_EFF, IMAGE_SIZE_EFF))
         cropped = cropped.astype(np.float32) / 255.0
         cropped = np.transpose(cropped, (2, 0, 1))
-        input_tensor = torch.from_numpy(cropped).unsqueeze(0)
 
-        # Classification
-        output = efficient_model(input_tensor)
-        probabilities = torch.softmax(output, dim=1)
+        crops.append(cropped)
+        valid_boxes.append((x1, y1, x2, y2))
 
-        predicted_index = torch.argmax(probabilities, dim=1).item()
-        confidence = probabilities[0][predicted_index].item()
+    if len(crops) == 0:
+        return "No Valid Tomato Crop", 200
+
+    # ----------------------------
+    # BATCH CLASSIFICATION
+    # ----------------------------
+    batch = torch.from_numpy(np.stack(crops))
+
+    outputs = efficient_model(batch)
+
+    probabilities = torch.softmax(outputs, dim=1)
+    predictions = torch.argmax(probabilities, dim=1)
+
+    # ----------------------------
+    # DRAW RESULTS
+    # ----------------------------
+    for i, (x1, y1, x2, y2) in enumerate(valid_boxes):
+
+        predicted_index = predictions[i].item()
+        confidence = probabilities[i][predicted_index].item()
 
         label_text = CLASS_MAP.get(predicted_index, "UNKNOWN")
-
         label = f"Tomato: {label_text} ({confidence:.2f})"
 
-        # Color logic
-        if predicted_index == 1:   # BAD
-            color = (0, 0, 255)    # Red
-        else:                      # GOOD
-            color = (0, 255, 0)    # Green
+        color = (0, 0, 255) if predicted_index == 1 else (0, 255, 0)
 
-        # Draw bounding box
         cv2.rectangle(original_image, (x1, y1), (x2, y2), color, 2)
 
-        # Draw label
         cv2.putText(
             original_image,
             label,
@@ -131,10 +144,13 @@ def detect():
             2
         )
 
-    # Convert to image response
+    # ----------------------------
+    # RETURN IMAGE
+    # ----------------------------
     result_image = Image.fromarray(original_image)
+
     img_io = io.BytesIO()
-    result_image.save(img_io, format="JPEG", quality=85)
+    result_image.save(img_io, format="JPEG", quality=80)
     img_io.seek(0)
 
     return send_file(img_io, mimetype="image/jpeg")
