@@ -14,6 +14,7 @@ import os
 torch.set_grad_enabled(False)
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
+cv2.setNumThreads(0)
 
 # ----------------------------
 # APP INIT
@@ -24,7 +25,7 @@ CORS(app)
 IMAGE_SIZE_YOLO = 192
 IMAGE_SIZE_EFF = 224
 
-# model class mapping
+# 0 = GOOD , 1 = BAD
 CLASS_MAP = {
     0: "GOOD",
     1: "BAD"
@@ -50,7 +51,7 @@ efficient_model.eval()
 print("Models Ready ✅")
 
 # ----------------------------
-# ROUTES
+# ROUTE
 # ----------------------------
 @app.route("/")
 def home():
@@ -64,21 +65,36 @@ def detect():
         return "No image uploaded", 400
 
     file_bytes = request.files["image"].read()
-    image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    image_np = np.array(image)
 
-    # Resize once for faster processing
-    image_np = cv2.resize(image_np, (512, 512))
+    # ----------------------------
+    # FAST IMAGE DECODING
+    # ----------------------------
+    file_np = np.frombuffer(file_bytes, np.uint8)
+    image_np = cv2.imdecode(file_np, cv2.IMREAD_COLOR)
+    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+
+    # ----------------------------
+    # SMART RESIZE (PREVENT HUGE IMAGES)
+    # ----------------------------
+    h, w = image_np.shape[:2]
+    MAX_DIM = 640
+
+    scale = MAX_DIM / max(h, w)
+    if scale < 1:
+        image_np = cv2.resize(image_np, (int(w * scale), int(h * scale)))
+
     original_image = image_np.copy()
 
     # ----------------------------
     # YOLO DETECTION
     # ----------------------------
-    results = yolo_model(
+    results = yolo_model.predict(
         image_np,
         imgsz=IMAGE_SIZE_YOLO,
-        verbose=False,
-        device="cpu"
+        conf=0.25,
+        iou=0.45,
+        device="cpu",
+        verbose=False
     )
 
     if len(results[0].boxes) == 0:
@@ -87,7 +103,7 @@ def detect():
     boxes = results[0].boxes.xyxy.cpu().numpy()
 
     # ----------------------------
-    # PREPARE CROPS FOR BATCH CLASSIFICATION
+    # PREPARE CROPS
     # ----------------------------
     crops = []
     valid_boxes = []
@@ -112,10 +128,9 @@ def detect():
     # ----------------------------
     # BATCH CLASSIFICATION
     # ----------------------------
-    batch = torch.from_numpy(np.stack(crops))
+    batch_tensor = torch.from_numpy(np.stack(crops))
 
-    outputs = efficient_model(batch)
-
+    outputs = efficient_model(batch_tensor)
     probabilities = torch.softmax(outputs, dim=1)
     predictions = torch.argmax(probabilities, dim=1)
 
